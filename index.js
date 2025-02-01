@@ -1,61 +1,37 @@
-const path = require("path");
-const express = require("express");
-const cors = require("cors");
-const morgan = require("morgan");
-const { init: initDB, Counter } = require("./db");
+const express = require('express');
+const morgan = require('morgan');
+const cloud = require('wx-server-sdk');
+const { initSync } = require('./sync');
+const { logger } = require('./utils');
 
-const logger = morgan("tiny");
+// 初始化云开发
+cloud.init({
+  env: process.env.WX_ENV
+});
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+
+// 请求日志
+app.use(morgan('combined'));
 app.use(express.json());
-app.use(cors());
-app.use(logger);
 
-// 首页
-app.get("/", async (req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
+// 健康检查
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
 });
 
-// 更新计数
-app.post("/api/count", async (req, res) => {
-  const { action } = req.body;
-  if (action === "inc") {
-    await Counter.create();
-  } else if (action === "clear") {
-    await Counter.destroy({
-      truncate: true,
-    });
-  }
-  res.send({
-    code: 0,
-    data: await Counter.count(),
-  });
-});
-
-// 获取计数
-app.get("/api/count", async (req, res) => {
-  const result = await Counter.count();
-  res.send({
-    code: 0,
-    data: result,
-  });
-});
-
-// 小程序调用，获取微信 Open ID
-app.get("/api/wx_openid", async (req, res) => {
-  if (req.headers["x-wx-source"]) {
-    res.send(req.headers["x-wx-openid"]);
+// 手动触发同步
+app.post('/sync', async (req, res) => {
+  try {
+    await initSync();
+    res.status(200).json({ message: 'Sync completed' });
+  } catch (err) {
+    logger.error('Sync failed:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
 const port = process.env.PORT || 80;
-
-async function bootstrap() {
-  await initDB();
-  app.listen(port, () => {
-    console.log("启动成功", port);
-  });
-}
-
-bootstrap();
+app.listen(port, () => {
+  logger.info(`Server running on port ${port}`);
+});
