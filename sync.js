@@ -25,18 +25,18 @@ const retryConfig = {
 };
 
 // 包装Notion API调用
-async function notionRequest(fn) {
+async function notionRequest(fn, description = '') {
   try {
-    return await retry(async () => {
-      const result = await fn();
+    logger.info(`Starting Notion request: ${description}`);
+    const result = await retry(async () => {
+      const response = await fn();
       await delay(500); // 添加500ms延迟
-      return result;
+      return response;
     }, retryConfig);
+    logger.info(`Completed Notion request: ${description}`);
+    return result;
   } catch (err) {
-    if (err.code === 'notionhq_client_request_timeout') {
-      logger.error('Notion API timeout:', err);
-      throw new Error('Notion API request timed out after retries');
-    }
+    logger.error(`Failed Notion request: ${description}`, err);
     throw err;
   }
 }
@@ -192,47 +192,76 @@ async function uploadMedia(url) {
   }
 }
 
-// 主同步函数
 async function initSync() {
   try {
-    const { results } = await notionRequest(() => 
-      notion.databases.query({
-        database_id: process.env.NOTION_DATABASE_ID,
-        filter: {
-          and: [
-            { property: 'type', select: { equals: 'Post' } },
-            { property: 'status', select: { equals: 'Published' } },
-            { property: 'synced', checkbox: { equals: false } }
-          ]
-        },
-        page_size: 10
-      })
-    );
+    let allResults = [];
+    let hasMore = true;
+    let startCursor = undefined;
+    
+    // 使用分页查询获取所有文章
+    while (hasMore) {
+      const response = await notionRequest(
+        () => notion.databases.query({
+          database_id: process.env.NOTION_DATABASE_ID,
+          start_cursor: startCursor,
+          page_size: 100, // 最大页面大小
+          filter: {
+            and: [
+              { property: 'type', select: { equals: 'Post' } },
+              { property: 'status', select: { equals: 'Published' } },
+              { property: 'synced', checkbox: { equals: false } }
+            ]
+          }
+        }),
+        `Query database page ${startCursor ? `from cursor ${startCursor}` : 'start'}`
+      );
 
-    logger.info(`Found ${results.length} articles to sync`);
+      allResults = allResults.concat(response.results);
+      hasMore = response.has_more;
+      startCursor = response.next_cursor;
+      
+      logger.info(`Retrieved ${response.results.length} articles, has more: ${hasMore}`);
+      
+      if (hasMore) {
+        await delay(1000); // 分页查询之间添加延迟
+      }
+    }
 
-    for (const page of results) {
+    logger.info(`Found total ${allResults.length} articles to sync`);
+
+    for (const [index, page] of allResults.entries()) {
       try {
+        logger.info(`Processing article ${index + 1}/${allResults.length}: ${page.id}`);
+        
         const props = page.properties;
         
-        const { results: blocks } = await notionRequest(() => 
-          notion.blocks.children.list({
+        // 获取页面内容
+        const { results: blocks } = await notionRequest(
+          () => notion.blocks.children.list({
             block_id: page.id,
             page_size: 100
-          })
+          }),
+          `Get content for article ${page.id}`
         );
         
+        // 转换内容
         const content = await convertContent(blocks);
         
+        // 获取属性值
         const title = props.title?.title?.[0]?.plain_text || 'Untitled';
         const author = props.author?.rich_text?.[0]?.plain_text || 'Anonymous';
         const summary = props.summary?.rich_text?.[0]?.plain_text || '';
         
+        logger.info(`Converting article: ${title}`);
+        
+        // 处理封面图片
         let thumb_media_id = '';
         if (page.cover?.type === 'external') {
           thumb_media_id = await uploadMedia(page.cover.external.url);
+          logger.info(`Uploaded external cover image for: ${title}`);
         } else if (page.cover?.type === 'file') {
           thumb_media_id = await uploadMedia(page.cover.file.url);
+          logger.info(`Uploaded file cover image for: ${title}`);
         } else {
           logger.warn(`No cover image found for article: ${title}`);
           thumb_media_id = process.env.DEFAULT_THUMB_MEDIA_ID || '';
@@ -248,23 +277,27 @@ async function initSync() {
           show_cover_pic: thumb_media_id ? 1 : 0
         };
         
+        logger.info(`Publishing article: ${title}`);
         await retry(() => publishArticle(article), retryConfig);
         
-        await notionRequest(() => 
-          notion.pages.update({
+        logger.info(`Updating sync status for article: ${title}`);
+        await notionRequest(
+          () => notion.pages.update({
             page_id: page.id,
             properties: {
               synced: { checkbox: true }
             }
-          })
+          }),
+          `Update sync status for ${page.id}`
         );
         
-        logger.info(`Published article: ${title}`);
+        logger.info(`Successfully published article: ${title}`);
         
         await delay(1000); // 添加处理间隔
         
       } catch (err) {
         logger.error(`Failed to publish article ${page.id}:`, err);
+        // 继续处理下一篇文章
         continue;
       }
     }
