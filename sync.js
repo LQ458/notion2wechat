@@ -1,12 +1,45 @@
 const { Client } = require('@notionhq/client');
 const cloud = require('wx-server-sdk');
-const axios = require('axios'); // 使用axios替代fetch
+const axios = require('axios');
 const { retry, logger } = require('./utils');
 
+// 创建Notion客户端实例
 const notion = new Client({ 
   auth: process.env.NOTION_API_KEY,
-  timeoutMs: 30000 // 增加Notion API超时时间
+  timeoutMs: 60000,
+  notionVersion: '2022-06-28'
 });
+
+// 添加请求延迟函数
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// 优化的重试配置
+const retryConfig = {
+  retries: 5,
+  minTimeout: 2000,
+  maxTimeout: 10000,
+  randomize: true,
+  onRetry: (error, attempt) => {
+    logger.warn(`Retry attempt ${attempt} due to error: ${error.message}`);
+  }
+};
+
+// 包装Notion API调用
+async function notionRequest(fn) {
+  try {
+    return await retry(async () => {
+      const result = await fn();
+      await delay(500); // 添加500ms延迟
+      return result;
+    }, retryConfig);
+  } catch (err) {
+    if (err.code === 'notionhq_client_request_timeout') {
+      logger.error('Notion API timeout:', err);
+      throw new Error('Notion API request timed out after retries');
+    }
+    throw err;
+  }
+}
 
 // 转换块内容为HTML
 async function blockToHtml(block) {
@@ -72,7 +105,6 @@ async function richTextToHtml(richText) {
   return richText.map(text => {
     let content = text.plain_text;
     
-    // 处理文本样式
     if (text.annotations.bold) {
       content = `<strong>${content}</strong>`;
     }
@@ -89,7 +121,6 @@ async function richTextToHtml(richText) {
       content = `<code>${content}</code>`;
     }
     
-    // 处理链接
     if (text.href) {
       content = `<a href="${text.href}" target="_blank">${content}</a>`;
     }
@@ -104,7 +135,6 @@ async function convertContent(blocks) {
   let inList = false;
   
   for (const block of blocks) {
-    // 处理列表的开始和结束
     if ((block.type === 'bulleted_list_item' || block.type === 'numbered_list_item') && !inList) {
       html += block.type === 'bulleted_list_item' ? '<ul>' : '<ol>';
       inList = true;
@@ -115,18 +145,18 @@ async function convertContent(blocks) {
     
     html += await blockToHtml(block);
     
-    // 处理子块
     if (block.has_children) {
-      const { results: children } = await notion.blocks.children.list({
-        block_id: block.id
-      });
+      const { results: children } = await notionRequest(() => 
+        notion.blocks.children.list({
+          block_id: block.id
+        })
+      );
       html += `<div style="margin-left:24px">
         ${await convertContent(children)}
       </div>`;
     }
   }
   
-  // 确保列表正确闭合
   if (inList) {
     html += html.endsWith('</ul>') ? '' : '</ul>';
   }
@@ -134,33 +164,26 @@ async function convertContent(blocks) {
   return html;
 }
 
-
-// 使用axios下载和上传媒体
+// 上传媒体文件
 async function uploadMedia(url) {
   try {
-    // 下载图片
     const response = await retry(async () => {
       const result = await axios({
         url,
         method: 'GET',
         responseType: 'arraybuffer',
-        timeout: 10000 // 10秒超时
+        timeout: 10000
       });
       return result;
-    }, {
-      retries: 3,
-      minTimeout: 1000,
-      maxTimeout: 5000
-    });
+    }, retryConfig);
 
-    // 上传到微信
     const buffer = Buffer.from(response.data);
     const result = await retry(() => 
       cloud.uploadFile({
         cloudPath: `covers/${Date.now()}-${Math.random().toString(36).substr(2, 6)}.jpg`,
         fileContent: buffer
       })
-    );
+    , retryConfig);
 
     return result.fileID;
   } catch (err) {
@@ -169,9 +192,10 @@ async function uploadMedia(url) {
   }
 }
 
+// 主同步函数
 async function initSync() {
   try {
-    const { results } = await retry(() => 
+    const { results } = await notionRequest(() => 
       notion.databases.query({
         database_id: process.env.NOTION_DATABASE_ID,
         filter: {
@@ -180,7 +204,8 @@ async function initSync() {
             { property: 'status', select: { equals: 'Published' } },
             { property: 'synced', checkbox: { equals: false } }
           ]
-        }
+        },
+        page_size: 10
       })
     );
 
@@ -190,23 +215,19 @@ async function initSync() {
       try {
         const props = page.properties;
         
-        // 获取页面内容
-        const { results: blocks } = await retry(() => 
+        const { results: blocks } = await notionRequest(() => 
           notion.blocks.children.list({
             block_id: page.id,
             page_size: 100
           })
         );
         
-        // 转换内容
         const content = await convertContent(blocks);
         
-        // 安全地获取属性值
         const title = props.title?.title?.[0]?.plain_text || 'Untitled';
         const author = props.author?.rich_text?.[0]?.plain_text || 'Anonymous';
         const summary = props.summary?.rich_text?.[0]?.plain_text || '';
         
-        // 处理封面图片
         let thumb_media_id = '';
         if (page.cover?.type === 'external') {
           thumb_media_id = await uploadMedia(page.cover.external.url);
@@ -217,7 +238,6 @@ async function initSync() {
           thumb_media_id = process.env.DEFAULT_THUMB_MEDIA_ID || '';
         }
         
-        // 创建文章
         const article = {
           title,
           thumb_media_id,
@@ -228,11 +248,9 @@ async function initSync() {
           show_cover_pic: thumb_media_id ? 1 : 0
         };
         
-        // 发布
-        await retry(() => publishArticle(article));
+        await retry(() => publishArticle(article), retryConfig);
         
-        // 更新状态
-        await retry(() => 
+        await notionRequest(() => 
           notion.pages.update({
             page_id: page.id,
             properties: {
@@ -242,6 +260,9 @@ async function initSync() {
         );
         
         logger.info(`Published article: ${title}`);
+        
+        await delay(1000); // 添加处理间隔
+        
       } catch (err) {
         logger.error(`Failed to publish article ${page.id}:`, err);
         continue;
