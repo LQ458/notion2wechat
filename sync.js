@@ -177,18 +177,31 @@ async function initSync() {
         // 转换内容
         const content = await convertContent(blocks);
         
-        // 上传封面
-        const coverUrl = await uploadMedia(props.cover.url);
+        // 安全地获取属性值
+        const title = props.title?.title?.[0]?.plain_text || 'Untitled';
+        const author = props.author?.rich_text?.[0]?.plain_text || 'Anonymous';
+        const summary = props.summary?.rich_text?.[0]?.plain_text || '';
+        
+        // 处理封面图片 - 从page level获取
+        let thumb_media_id = '';
+        if (page.cover?.type === 'external') {
+          thumb_media_id = await uploadMedia(page.cover.external.url);
+        } else if (page.cover?.type === 'file') {
+          thumb_media_id = await uploadMedia(page.cover.file.url);
+        } else {
+          logger.warn(`No cover image found for article: ${title}`);
+          thumb_media_id = process.env.DEFAULT_THUMB_MEDIA_ID || '';
+        }
         
         // 创建文章
         const article = {
-          title: props.title.title[0].plain_text,
-          thumb_media_id: coverUrl,
-          author: props.author.rich_text[0].plain_text,
-          digest: props.summary.rich_text[0].plain_text,
+          title,
+          thumb_media_id,
+          author,
+          digest: summary,
           content,
           content_source_url: page.url,
-          show_cover_pic: 1
+          show_cover_pic: thumb_media_id ? 1 : 0
         };
         
         // 发布
@@ -202,7 +215,7 @@ async function initSync() {
           }
         });
         
-        logger.info(`Published article: ${article.title}`);
+        logger.info(`Published article: ${title}`);
       } catch (err) {
         logger.error(`Failed to publish article ${page.id}:`, err);
         continue;
