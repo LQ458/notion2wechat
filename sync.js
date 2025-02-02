@@ -2,6 +2,10 @@ const { Client } = require('@notionhq/client');
 const cloud = require('wx-server-sdk');
 const axios = require('axios');
 const { retry, logger } = require('./utils');
+const stream = require('stream');
+const { promisify } = require('util');
+
+const pipeline = promisify(stream.pipeline);
 
 // 创建Notion客户端实例
 const notion = new Client({ 
@@ -24,22 +28,55 @@ const retryConfig = {
 
 // 优化的媒体下载函数
 async function downloadMedia(url) {
-  logger.info(`Downloading media from: ${url}`);
+  logger.info(`Starting media download from: ${url}`);
   try {
     const response = await axios({
       method: 'GET',
       url,
-      responseType: 'arraybuffer',
+      responseType: 'stream',
       timeout: 15000,
       maxContentLength: 10 * 1024 * 1024, // 10MB限制
       validateStatus: status => status === 200
     });
-    return response.data;
+
+    // 创建一个内存buffer来存储数据
+    const chunks = [];
+    let totalLength = 0;
+
+    // 使用stream处理下载
+    await new Promise((resolve, reject) => {
+      response.data.on('data', chunk => {
+        chunks.push(chunk);
+        totalLength += chunk.length;
+        logger.debug(`Downloaded ${totalLength} bytes`);
+        
+        // 检查大小限制
+        if (totalLength > 10 * 1024 * 1024) {
+          reject(new Error('File too large'));
+        }
+      });
+
+      response.data.on('end', () => {
+        logger.info(`Download completed, total size: ${totalLength} bytes`);
+        resolve();
+      });
+
+      response.data.on('error', err => {
+        logger.error('Download stream error:', err);
+        reject(err);
+      });
+    });
+
+    const buffer = Buffer.concat(chunks);
+    logger.info(`Media download completed, size: ${buffer.length} bytes`);
+    return buffer;
+
   } catch (err) {
     logger.error('Media download failed:', {
       url,
       error: err.message,
-      code: err.code
+      code: err.code,
+      stack: err.stack
     });
     throw err;
   }
@@ -48,206 +85,163 @@ async function downloadMedia(url) {
 // 优化的媒体上传函数
 async function uploadMedia(url) {
   try {
-    const buffer = await retry(() => downloadMedia(url), retryConfig);
+    logger.info(`Starting media upload process for: ${url}`);
+    const buffer = await retry(() => downloadMedia(url), {
+      ...retryConfig,
+      onRetry: (err) => {
+        logger.warn(`Media download retry due to: ${err.message}`);
+      }
+    });
     
     if (!buffer || buffer.length === 0) {
       throw new Error('Empty media content');
     }
     
     logger.info(`Uploading media to WeChat, size: ${buffer.length} bytes`);
-    const result = await retry(() => 
-      cloud.uploadFile({
-        cloudPath: `covers/${Date.now()}-${Math.random().toString(36).substr(2, 6)}.jpg`,
-        fileContent: buffer
-      }),
-      retryConfig
+    const result = await retry(
+      async () => {
+        try {
+          const uploadResult = await cloud.uploadFile({
+            cloudPath: `covers/${Date.now()}-${Math.random().toString(36).substr(2, 6)}.jpg`,
+            fileContent: buffer
+          });
+          logger.info(`Upload successful, fileID: ${uploadResult.fileID}`);
+          return uploadResult;
+        } catch (err) {
+          logger.error('WeChat upload error:', {
+            error: err.message,
+            stack: err.stack
+          });
+          throw err;
+        }
+      },
+      {
+        ...retryConfig,
+        onRetry: (err) => {
+          logger.warn(`WeChat upload retry due to: ${err.message}`);
+        }
+      }
     );
     
     logger.info(`Media upload completed: ${result.fileID}`);
     return result.fileID;
   } catch (err) {
-    logger.error('Media upload failed:', err);
-    // 返回默认图片ID而不是抛出错误
+    logger.error('Media upload process failed:', {
+      url,
+      error: err.message,
+      stack: err.stack
+    });
+    logger.info('Using default thumb media id');
     return process.env.DEFAULT_THUMB_MEDIA_ID || '';
   }
 }
 
-// 分页获取blocks
+// 获取所有blocks
 async function getAllBlocks(blockId) {
-  let blocks = [];
+  logger.info(`Getting blocks for: ${blockId}`);
+  const blocks = [];
   let cursor;
   
   try {
     do {
-      const response = await retry(() => 
-        notion.blocks.children.list({
+      const response = await retry(
+        () => notion.blocks.children.list({
           block_id: blockId,
-          page_size: 50,
-          start_cursor: cursor
+          start_cursor: cursor,
+          page_size: 100
         }),
         retryConfig
       );
       
-      blocks = blocks.concat(response.results);
+      blocks.push(...response.results);
       cursor = response.next_cursor;
       
+      logger.info(`Retrieved ${blocks.length} blocks so far`);
+      
       if (cursor) {
-        await delay(500);
+        await delay(1000);
       }
     } while (cursor);
     
+    logger.info(`Total blocks retrieved: ${blocks.length}`);
     return blocks;
   } catch (err) {
-    logger.error(`Failed to get blocks for ${blockId}:`, err);
+    logger.error(`Failed to get blocks for ${blockId}:`, {
+      error: err.message,
+      stack: err.stack
+    });
     throw err;
   }
 }
 
-// 转换块内容为HTML
-async function blockToHtml(block) {
+// 发布文章到微信
+async function publishArticle(article) {
+  logger.info(`Publishing article: ${article.title}`);
   try {
-    let html = '';
-    
-    switch(block.type) {
-      case 'paragraph':
-        html = `<p>${await richTextToHtml(block.paragraph.rich_text)}</p>`;
-        break;
-      case 'heading_1':
-        html = `<h1>${await richTextToHtml(block.heading_1.rich_text)}</h1>`;
-        break;
-      case 'heading_2':
-        html = `<h2>${await richTextToHtml(block.heading_2.rich_text)}</h2>`;
-        break;
-      case 'heading_3':
-        html = `<h3>${await richTextToHtml(block.heading_3.rich_text)}</h3>`;
-        break;
-      case 'bulleted_list_item':
-        html = `<li>${await richTextToHtml(block.bulleted_list_item.rich_text)}</li>`;
-        break;
-      case 'numbered_list_item':
-        html = `<li>${await richTextToHtml(block.numbered_list_item.rich_text)}</li>`;
-        break;
-      case 'code':
-        html = `<pre><code>${await richTextToHtml(block.code.rich_text)}</code></pre>`;
-        break;
-      case 'image':
-        try {
-          const imageUrl = block.image.type === 'external' 
-            ? block.image.external.url 
-            : block.image.file.url;
-          const wxUrl = await uploadMedia(imageUrl);
-          html = `<img src="${wxUrl}" style="max-width:100%"/>`;
-        } catch (err) {
-          logger.error('Failed to process image:', err);
-          html = ''; // 跳过失败的图片
-        }
-        break;
-      case 'quote':
-        html = `<blockquote>${await richTextToHtml(block.quote.rich_text)}</blockquote>`;
-        break;
-      case 'divider':
-        html = '<hr/>';
-        break;
-      default:
-        html = '';
-    }
-    
-    return html;
-  } catch (err) {
-    logger.error(`Failed to convert block to HTML:`, {
-      blockType: block.type,
-      error: err.message
+    const result = await cloud.openapi.wxacode.submitPages({
+      articles: [article]
     });
-    return ''; // 返回空字符串而不是抛出错误
-  }
-}
-
-// 转换富文本为HTML
-async function richTextToHtml(richText) {
-  if (!richText || richText.length === 0) return '';
-  
-  try {
-    return richText.map(text => {
-      let content = text.plain_text;
-      
-      if (text.annotations.bold) content = `<strong>${content}</strong>`;
-      if (text.annotations.italic) content = `<em>${content}</em>`;
-      if (text.annotations.strikethrough) content = `<del>${content}</del>`;
-      if (text.annotations.underline) content = `<u>${content}</u>`;
-      if (text.annotations.code) content = `<code>${content}</code>`;
-      
-      if (text.href) {
-        content = `<a href="${text.href}" target="_blank">${content}</a>`;
-      }
-      
-      return content;
-    }).join('');
-  } catch (err) {
-    logger.error('Failed to convert rich text:', err);
-    return '';
-  }
-}
-
-// 转换内容
-async function convertContent(blocks) {
-  let html = '';
-  let inList = false;
-  
-  try {
-    for (const block of blocks) {
-      if ((block.type === 'bulleted_list_item' || block.type === 'numbered_list_item') && !inList) {
-        html += block.type === 'bulleted_list_item' ? '<ul>' : '<ol>';
-        inList = true;
-      } else if (inList && block.type !== 'bulleted_list_item' && block.type !== 'numbered_list_item') {
-        html += inList ? (html.endsWith('</li>') ? '</ul>' : '') : '';
-        inList = false;
-      }
-      
-      html += await blockToHtml(block);
-      
-      if (inList && !blocks[blocks.indexOf(block) + 1]?.type?.includes('list_item')) {
-        html += '</ul>';
-        inList = false;
-      }
-      
-      await delay(100); // 添加小延迟避免处理过快
+    
+    if (!result.errCode === 0) {
+      throw new Error(`WeChat API error: ${result.errMsg}`);
     }
     
-    return html;
+    logger.info(`Article published successfully: ${article.title}`);
+    return result;
   } catch (err) {
-    logger.error('Content conversion failed:', err);
+    logger.error('Article publish failed:', {
+      title: article.title,
+      error: err.message,
+      stack: err.stack
+    });
     throw err;
   }
 }
 
 // 主同步函数
 async function initSync() {
+  logger.info('Starting sync process');
   try {
-    const { results } = await retry(() => 
-      notion.databases.query({
+    const response = await retry(
+      () => notion.databases.query({
         database_id: process.env.NOTION_DATABASE_ID,
         filter: {
           and: [
-            { property: 'type', select: { equals: 'Post' } },
-            { property: 'status', select: { equals: 'Published' } },
-            { property: 'synced', checkbox: { equals: false } }
+            {
+              property: 'status',
+              select: {
+                equals: 'Ready'
+              }
+            },
+            {
+              property: 'synced',
+              checkbox: {
+                equals: false
+              }
+            }
           ]
         }
       }),
       retryConfig
     );
-
-    logger.info(`Found ${results.length} articles to sync`);
-
-    for (const page of results) {
+    
+    const articles = response.results;
+    logger.info(`Found ${articles.length} articles to sync`);
+    
+    for (const page of articles) {
       try {
         const props = page.properties;
-        const title = props.title?.title?.[0]?.plain_text || 'Untitled';
+        const title = props.title?.title?.[0]?.plain_text;
+        
+        if (!title) {
+          logger.warn(`Skipping article with no title: ${page.id}`);
+          continue;
+        }
         
         logger.info(`Processing article: ${title}`);
         
         const blocks = await getAllBlocks(page.id);
-        logger.info(`Converting article: ${title}`);
+        logger.info(`Converting content for: ${title}`);
         const content = await convertContent(blocks);
         
         const author = props.author?.rich_text?.[0]?.plain_text || 'Anonymous';
@@ -260,6 +254,7 @@ async function initSync() {
             : page.cover.file.url;
           thumb_media_id = await uploadMedia(coverUrl);
         } else {
+          logger.info(`No cover image, using default for: ${title}`);
           thumb_media_id = process.env.DEFAULT_THUMB_MEDIA_ID || '';
         }
         
@@ -288,7 +283,7 @@ async function initSync() {
         );
         
         logger.info(`Successfully processed article: ${title}`);
-        await delay(2000); // 文章处理间隔
+        await delay(2000);
         
       } catch (err) {
         logger.error(`Failed to process article:`, {
@@ -297,12 +292,11 @@ async function initSync() {
           error: err.message,
           stack: err.stack
         });
-        // 继续处理下一篇
         continue;
       }
     }
     
-    logger.info('Sync completed');
+    logger.info('Sync completed successfully');
     
   } catch (err) {
     logger.error('Sync failed:', {
