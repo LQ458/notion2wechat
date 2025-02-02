@@ -24,28 +24,64 @@ const retryConfig = {
   }
 };
 
-// 包装Notion API调用
-async function notionRequest(fn, description = '') {
+// 下载媒体文件
+async function downloadMedia(url) {
+  logger.info(`Downloading media from: ${url}`);
   try {
-    logger.info(`Starting Notion request: ${description}`);
-    const result = await retry(async () => {
-      const response = await fn();
-      await delay(1000); // 增加延迟以避免rate limit
-      return response;
-    }, retryConfig);
-    logger.info(`Completed Notion request: ${description}`);
-    return result;
+    const response = await axios({
+      method: 'GET',
+      url,
+      responseType: 'arraybuffer',
+      timeout: 30000, // 30秒超时
+      maxContentLength: 10 * 1024 * 1024, // 10MB限制
+      validateStatus: status => status === 200
+    });
+    return response.data;
   } catch (err) {
-    logger.error(`Failed Notion request: ${description}`, {
+    logger.error(`Failed to download media: ${url}`, {
       error: err.message,
-      code: err.code,
-      status: err.status
+      code: err.code
     });
     throw err;
   }
 }
 
-// 分页获取blocks
+// 上传媒体文件到云存储
+async function uploadMedia(url) {
+  try {
+    const buffer = await retry(
+      () => downloadMedia(url),
+      {
+        ...retryConfig,
+        retries: 2 // 减少重试次数
+      }
+    );
+
+    if (!buffer || buffer.length === 0) {
+      throw new Error('Empty media file');
+    }
+
+    logger.info(`Uploading media file to cloud storage, size: ${buffer.length}`);
+    const result = await retry(() =>
+      cloud.uploadFile({
+        cloudPath: `covers/${Date.now()}-${Math.random().toString(36).substr(2, 6)}.jpg`,
+        fileContent: buffer
+      })
+    );
+
+    logger.info(`Successfully uploaded media file: ${result.fileID}`);
+    return result.fileID;
+  } catch (err) {
+    logger.error('Failed to upload media:', {
+      error: err.message,
+      url
+    });
+    // 返回默认图片
+    return process.env.DEFAULT_THUMB_MEDIA_ID || '';
+  }
+}
+
+// 获取所有blocks
 async function getAllBlocks(blockId) {
   let blocks = [];
   let hasMore = true;
@@ -67,10 +103,13 @@ async function getAllBlocks(blockId) {
       startCursor = response.next_cursor;
 
       if (hasMore) {
-        await delay(1000); // Rate limit 处理
+        await delay(500);
       }
     } catch (err) {
-      logger.error(`Failed to get blocks for ${blockId}:`, err);
+      logger.error(`Failed to get blocks for ${blockId}:`, {
+        error: err.message,
+        cursor: startCursor
+      });
       throw err;
     }
   }
@@ -115,11 +154,19 @@ async function blockToHtml(block) {
         break;
         
       case 'image':
-        const imageUrl = block.image.type === 'external' 
-          ? block.image.external.url 
-          : block.image.file.url;
-        const wxUrl = await uploadMedia(imageUrl);
-        html = `<img src="${wxUrl}" style="max-width:100%"/>`;
+        try {
+          const imageUrl = block.image.type === 'external' 
+            ? block.image.external.url 
+            : block.image.file.url;
+          const wxUrl = await uploadMedia(imageUrl);
+          html = `<img src="${wxUrl}" style="max-width:100%"/>`;
+        } catch (err) {
+          logger.error('Failed to process image block:', {
+            error: err.message,
+            blockId: block.id
+          });
+          html = ''; // Skip failed images
+        }
         break;
         
       case 'quote':
@@ -131,15 +178,20 @@ async function blockToHtml(block) {
       case 'divider':
         html = '<hr/>';
         break;
+        
+      default:
+        logger.warn(`Unsupported block type: ${block.type}`);
+        html = '';
     }
     
     return html;
   } catch (err) {
     logger.error(`Failed to convert block to HTML:`, {
-      blockType: block.type,
-      error: err.message
+      error: err.message,
+      blockId: block.id,
+      type: block.type
     });
-    throw err;
+    return '';
   }
 }
 
@@ -175,37 +227,39 @@ async function richTextToHtml(richText) {
     }).join('');
   } catch (err) {
     logger.error('Failed to convert rich text to HTML:', err);
-    throw err;
+    return '';
   }
 }
 
 // 转换Notion内容
 async function convertContent(blocks) {
+  let html = '';
+  let inList = false;
+  
   try {
-    let html = '';
-    let inList = false;
-    
     for (const block of blocks) {
-      if ((block.type === 'bulleted_list_item' || block.type === 'numbered_list_item') && !inList) {
-        html += block.type === 'bulleted_list_item' ? '<ul>' : '<ol>';
-        inList = true;
-      } else if (inList && block.type !== 'bulleted_list_item' && block.type !== 'numbered_list_item') {
-        html += inList ? (html.endsWith('</ul>') ? '' : '</ul>') : '';
+      const blockHtml = await blockToHtml(block);
+      
+      if (block.type === 'bulleted_list_item' || block.type === 'numbered_list_item') {
+        if (!inList) {
+          html += block.type === 'bulleted_list_item' ? '<ul>' : '<ol>';
+          inList = true;
+        }
+      } else if (inList) {
+        html += block.type === 'bulleted_list_item' ? '</ul>' : '</ol>';
         inList = false;
       }
       
-      html += await blockToHtml(block);
+      html += blockHtml;
       
       if (block.has_children) {
         const children = await getAllBlocks(block.id);
-        html += `<div style="margin-left:24px">
-          ${await convertContent(children)}
-        </div>`;
+        html += await convertContent(children);
       }
     }
     
     if (inList) {
-      html += html.endsWith('</ul>') ? '' : '</ul>';
+      html += blocks[blocks.length - 1].type === 'bulleted_list_item' ? '</ul>' : '</ol>';
     }
     
     return html;
@@ -215,96 +269,48 @@ async function convertContent(blocks) {
   }
 }
 
-// 使用axios下载和上传媒体
-async function uploadMedia(url) {
-  try {
-    logger.info(`Downloading media from: ${url}`);
-    const response = await retry(async () => {
-      const result = await axios({
-        url,
-        method: 'GET',
-        responseType: 'arraybuffer',
-        timeout: 10000
-      });
-      return result;
-    }, retryConfig);
-
-    logger.info('Uploading media to cloud storage');
-    const buffer = Buffer.from(response.data);
-    const result = await retry(() => 
-      cloud.uploadFile({
-        cloudPath: `covers/${Date.now()}-${Math.random().toString(36).substr(2, 6)}.jpg`,
-        fileContent: buffer
-      })
-    );
-
-    logger.info(`Media uploaded successfully: ${result.fileID}`);
-    return result.fileID;
-  } catch (err) {
-    logger.error('Failed to upload media:', err);
-    throw err;
-  }
+// 发布文章
+async function publishArticle(article) {
+  // 实现发布逻辑
+  return true;
 }
 
 async function initSync() {
   try {
-    let allResults = [];
-    let hasMore = true;
-    let startCursor = undefined;
-    
-    // 分页获取所有待同步文章
-    while (hasMore) {
-      const response = await notionRequest(
-        () => notion.databases.query({
-          database_id: process.env.NOTION_DATABASE_ID,
-          start_cursor: startCursor,
-          page_size: 10,
-          filter: {
-            and: [
-              { property: 'type', select: { equals: 'Post' } },
-              { property: 'status', select: { equals: 'Published' } },
-              { property: 'synced', checkbox: { equals: false } }
-            ]
-          }
-        }),
-        'Query database for articles'
-      );
+    const { results } = await notionRequest(
+      () => notion.databases.query({
+        database_id: process.env.NOTION_DATABASE_ID,
+        filter: {
+          and: [
+            { property: 'type', select: { equals: 'Post' } },
+            { property: 'status', select: { equals: 'Published' } },
+            { property: 'synced', checkbox: { equals: false } }
+          ]
+        }
+      }),
+      'Query database for articles'
+    );
 
-      allResults = allResults.concat(response.results);
-      hasMore = response.has_more;
-      startCursor = response.next_cursor;
+    logger.info(`Found ${results.length} articles to sync`);
 
-      if (hasMore) {
-        await delay(1000);
-      }
-    }
-
-    logger.info(`Found ${allResults.length} articles to sync`);
-
-    for (const page of allResults) {
+    for (const page of results) {
       try {
         const props = page.properties;
         const title = props.title?.title?.[0]?.plain_text || 'Untitled';
         
-        logger.info(`Processing article: ${title}`);
-        
-        // 获取页面内容
-        const blocks = await getAllBlocks(page.id);
-        
         logger.info(`Converting article: ${title}`);
+        
+        const blocks = await getAllBlocks(page.id);
         const content = await convertContent(blocks);
         
         const author = props.author?.rich_text?.[0]?.plain_text || 'Anonymous';
         const summary = props.summary?.rich_text?.[0]?.plain_text || '';
         
-        // 处理封面图片
         let thumb_media_id = '';
         if (page.cover?.type === 'external') {
           thumb_media_id = await uploadMedia(page.cover.external.url);
-          logger.info(`Uploaded external cover image for: ${title}`);
         } else if (page.cover?.type === 'file') {
           thumb_media_id = await uploadMedia(page.cover.file.url);
-          logger.info(`Uploaded file cover image for: ${title}`);
         } else {
           logger.warn(`No cover image found for article: ${title}`);
           thumb_media_id = process.env.DEFAULT_THUMB_MEDIA_ID || '';
@@ -335,12 +341,12 @@ async function initSync() {
         );
         
         logger.info(`Successfully published article: ${title}`);
-        
-        await delay(2000); // 增加文章处理间隔
+        await delay(2000);
         
       } catch (err) {
-        logger.error(`Failed to process article ${page.id}:`, {
-          title: props.title?.title?.[0]?.plain_text,
+        logger.error(`Failed to process article:`, {
+          pageId: page.id,
+          title: page.properties?.title?.title?.[0]?.plain_text,
           error: err.message,
           stack: err.stack
         });
