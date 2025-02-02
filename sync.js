@@ -1,8 +1,12 @@
 const { Client } = require('@notionhq/client');
 const cloud = require('wx-server-sdk');
+const axios = require('axios'); // 使用axios替代fetch
 const { retry, logger } = require('./utils');
 
-const notion = new Client({ auth: process.env.NOTION_API_KEY });
+const notion = new Client({ 
+  auth: process.env.NOTION_API_KEY,
+  timeoutMs: 30000 // 增加Notion API超时时间
+});
 
 // 转换块内容为HTML
 async function blockToHtml(block) {
@@ -130,37 +134,55 @@ async function convertContent(blocks) {
   return html;
 }
 
-// 上传媒体文件
+
+// 使用axios下载和上传媒体
 async function uploadMedia(url) {
   try {
-    const response = await fetch(url);
-    const buffer = await response.buffer();
-    
-    const uploadResult = await cloud.uploadFile({
-      cloudPath: `images/${Date.now()}-${Math.random().toString(36).substr(2, 9)}.jpg`,
-      fileContent: buffer,
+    // 下载图片
+    const response = await retry(async () => {
+      const result = await axios({
+        url,
+        method: 'GET',
+        responseType: 'arraybuffer',
+        timeout: 10000 // 10秒超时
+      });
+      return result;
+    }, {
+      retries: 3,
+      minTimeout: 1000,
+      maxTimeout: 5000
     });
-    
-    return uploadResult.fileID;
+
+    // 上传到微信
+    const buffer = Buffer.from(response.data);
+    const result = await retry(() => 
+      cloud.uploadFile({
+        cloudPath: `covers/${Date.now()}-${Math.random().toString(36).substr(2, 6)}.jpg`,
+        fileContent: buffer
+      })
+    );
+
+    return result.fileID;
   } catch (err) {
     logger.error('Failed to upload media:', err);
     throw err;
   }
 }
 
-// 主同步逻辑
 async function initSync() {
   try {
-    const { results } = await notion.databases.query({
-      database_id: process.env.NOTION_DATABASE_ID,
-      filter: {
-        and: [
-          { property: 'type', select: { equals: 'Post' } },
-          { property: 'status', select: { equals: 'Published' } },
-          { property: 'synced', checkbox: { equals: false } }
-        ]
-      }
-    });
+    const { results } = await retry(() => 
+      notion.databases.query({
+        database_id: process.env.NOTION_DATABASE_ID,
+        filter: {
+          and: [
+            { property: 'type', select: { equals: 'Post' } },
+            { property: 'status', select: { equals: 'Published' } },
+            { property: 'synced', checkbox: { equals: false } }
+          ]
+        }
+      })
+    );
 
     logger.info(`Found ${results.length} articles to sync`);
 
@@ -169,10 +191,12 @@ async function initSync() {
         const props = page.properties;
         
         // 获取页面内容
-        const { results: blocks } = await notion.blocks.children.list({
-          block_id: page.id,
-          page_size: 100
-        });
+        const { results: blocks } = await retry(() => 
+          notion.blocks.children.list({
+            block_id: page.id,
+            page_size: 100
+          })
+        );
         
         // 转换内容
         const content = await convertContent(blocks);
@@ -182,7 +206,7 @@ async function initSync() {
         const author = props.author?.rich_text?.[0]?.plain_text || 'Anonymous';
         const summary = props.summary?.rich_text?.[0]?.plain_text || '';
         
-        // 处理封面图片 - 从page level获取
+        // 处理封面图片
         let thumb_media_id = '';
         if (page.cover?.type === 'external') {
           thumb_media_id = await uploadMedia(page.cover.external.url);
@@ -208,12 +232,14 @@ async function initSync() {
         await retry(() => publishArticle(article));
         
         // 更新状态
-        await notion.pages.update({
-          page_id: page.id,
-          properties: {
-            synced: { checkbox: true }
-          }
-        });
+        await retry(() => 
+          notion.pages.update({
+            page_id: page.id,
+            properties: {
+              synced: { checkbox: true }
+            }
+          })
+        );
         
         logger.info(`Published article: ${title}`);
       } catch (err) {
