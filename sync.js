@@ -33,7 +33,7 @@ async function uploadImage(url) {
       return await cloud.uploadFile({
         cloudPath: `images/${Date.now()}-${Math.random()
           .toString(36)
-          .substr(2, 9)}.${buffer.type.split("/")[1]}`,
+          .substring(2, 9)}.${buffer.type.split("/")[1]}`,
         fileContent: buffer,
       });
     }, config.wechat.retryConfig);
@@ -168,16 +168,31 @@ async function initSync() {
 
   try {
     while (hasMore) {
-      // 查询待发布文章
+      // 使用重试配置获取页面
       const response = await retry(
         () =>
           notion.databases.query({
             database_id: process.env.NOTION_DATABASE_ID,
             filter: {
               and: [
-                { property: "type", select: { equals: "Post" } },
-                { property: "status", status: { equals: "Published" } },
-                { property: "synced", checkbox: { equals: false } },
+                {
+                  property: "type", // 确保这里的属性名与Notion数据库中的完全一致
+                  select: {
+                    equals: "Post",
+                  },
+                },
+                {
+                  property: "status", // 确保这里的属性名与Notion数据库中的完全一致
+                  select: {
+                    equals: "Published",
+                  },
+                },
+                {
+                  property: "synced", // 确保这里的属性名与Notion数据库中的完全一致
+                  checkbox: {
+                    equals: false,
+                  },
+                },
               ],
             },
             page_size: config.notion.pageSize,
@@ -189,25 +204,25 @@ async function initSync() {
       hasMore = response.has_more;
       startCursor = response.next_cursor;
 
-      // 处理每篇文章
       for (const page of response.results) {
         try {
           const props = page.properties;
-          const title = props.title?.title?.[0]?.plain_text;
 
-          logger.info(`Processing article: ${title}`);
-
-          // 获取文章内容
-          const blocks = await getAllBlocks(page.id);
-          const content = await convertContent(blocks);
+          // 确保属性存在且格式正确
+          if (!props.Title?.title?.[0]?.plain_text) {
+            logger.warn("Skipping page due to missing title", {
+              pageId: page.id,
+            });
+            continue;
+          }
 
           const article = {
-            title,
-            author: props.author?.rich_text?.[0]?.plain_text || "Anonymous",
-            summary: props.summary?.rich_text?.[0]?.plain_text || "",
-            content,
-            cover: props.cover?.url,
+            title: props.Title.title[0].plain_text,
+            author: props.Author?.rich_text?.[0]?.plain_text || "Anonymous",
+            summary: props.Summary?.rich_text?.[0]?.plain_text || "",
+            cover: props.Cover?.files?.[0]?.file?.url,
             sourceUrl: page.url,
+            content: await getAllBlocks(page.id),
           };
 
           // 发布文章
@@ -219,31 +234,28 @@ async function initSync() {
               notion.pages.update({
                 page_id: page.id,
                 properties: {
-                  synced: { checkbox: true },
+                  Synced: { checkbox: true },
                 },
               }),
             config.notion.retryConfig
           );
 
           processedCount++;
-          logger.info(`Successfully processed article: ${title}`);
+          logger.info(`Successfully processed article: ${article.title}`);
+
+          // 处理间隔
           await new Promise((resolve) =>
             setTimeout(resolve, config.sync.delay)
           );
         } catch (err) {
-          logger.error(`Failed to process article:`, {
+          logger.error("Failed to process article:", {
             pageId: page.id,
-            title: page.properties.title?.title?.[0]?.plain_text,
+            title: props.Title?.title?.[0]?.plain_text,
             error: err.message,
             stack: err.stack,
           });
           continue;
         }
-      }
-
-      if (hasMore) {
-        logger.info("Processing next page...");
-        await new Promise((resolve) => setTimeout(resolve, config.sync.delay));
       }
     }
 
