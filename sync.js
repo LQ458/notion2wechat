@@ -175,30 +175,23 @@ async function initSync() {
             database_id: process.env.NOTION_DATABASE_ID,
             filter: {
               and: [
-                {
-                  property: "type", // 确保这里的属性名与Notion数据库中的完全一致
-                  select: {
-                    equals: "Post",
-                  },
-                },
-                {
-                  property: "status", // 确保这里的属性名与Notion数据库中的完全一致
-                  select: {
-                    equals: "Published",
-                  },
-                },
-                {
-                  property: "synced", // 确保这里的属性名与Notion数据库中的完全一致
-                  checkbox: {
-                    equals: false,
-                  },
-                },
+                { property: "type", select: { equals: "Post" } },
+                { property: "status", select: { equals: "Published" } },
+                { property: "synced", checkbox: { equals: false } },
               ],
             },
             page_size: config.notion.pageSize,
             start_cursor: startCursor,
           }),
-        config.notion.retryConfig
+        {
+          ...config.notion.retryConfig,
+          onRetry: (err) => {
+            logger.warn("Retrying database query due to error:", {
+              error: err.message,
+              code: err.code,
+            });
+          },
+        }
       );
 
       hasMore = response.has_more;
@@ -208,10 +201,11 @@ async function initSync() {
         try {
           const props = page.properties;
 
-          // 确保属性存在且格式正确
-          if (!props.Title?.title?.[0]?.plain_text) {
-            logger.warn("Skipping page due to missing title", {
+          // 添加更详细的属性检查
+          if (!props.Title || !props.Title.title || !props.Title.title.length) {
+            logger.warn("Skipping page due to missing or invalid title", {
               pageId: page.id,
+              properties: Object.keys(props),
             });
             continue;
           }
@@ -237,7 +231,15 @@ async function initSync() {
                   Synced: { checkbox: true },
                 },
               }),
-            config.notion.retryConfig
+            {
+              ...config.notion.retryConfig,
+              onRetry: (err) => {
+                logger.warn("Retrying page update due to error:", {
+                  error: err.message,
+                  pageId: page.id,
+                });
+              },
+            }
           );
 
           processedCount++;
