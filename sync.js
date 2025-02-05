@@ -176,15 +176,15 @@ async function initSync() {
             filter: {
               and: [
                 {
-                  property: "Type",
+                  property: "type",
                   select: { equals: "Post" },
                 },
                 {
-                  property: "Status",
+                  property: "status",
                   select: { equals: "Published" },
                 },
                 {
-                  property: "Synced",
+                  property: "synced",
                   checkbox: { equals: false },
                 },
               ],
