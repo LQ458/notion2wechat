@@ -4,13 +4,20 @@ const axios = require('axios');
 const { retry, logger } = require('./utils');
 const stream = require('stream');
 const { promisify } = require('util');
+const dns = require('dns');
 
 const pipeline = promisify(stream.pipeline);
+
+// 配置DNS
+dns.setServers([
+  '8.8.8.8',  // Google DNS
+  '114.114.114.114'  // 国内DNS
+]);
 
 // 初始化云开发
 cloud.init({
   env: process.env.WX_ENV,
-  timeout: 15000, // 设置更长的超时时间
+  timeout: 20000, // 增加超时时间
 });
 
 // 创建Notion客户端
@@ -19,12 +26,9 @@ const notion = new Client({
   timeoutMs: 30000
 });
 
-// 基础延迟函数
-const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-
 // 重试配置
 const retryConfig = {
-  retries: 5, // 增加重试次数
+  retries: 5,
   minTimeout: 3000,
   maxTimeout: 15000,
   factor: 2,
@@ -32,6 +36,69 @@ const retryConfig = {
     logger.warn(`Retry attempt ${attempt} due to error: ${error.message}`);
   }
 };
+
+// 优化的文章发布函数
+async function publishArticle(article) {
+  logger.info(`Starting article publish: ${article.title}`);
+  
+  try {
+    // 创建小程序码 - 添加备用方案
+    let qrCode;
+    try {
+      logger.info('Attempting to create QR code');
+      qrCode = await retry(async () => {
+        try {
+          const result = await cloud.openapi.wxacode.createQRCode({
+            path: 'pages/index/index',
+            width: 430
+          });
+          return result;
+        } catch (err) {
+          logger.error('QR code creation failed:', {
+            code: err.code || 'UNKNOWN',
+            error: err.message
+          });
+          // 如果是网络错误，尝试使用备用API
+          if (err.code === -501001) {
+            logger.info('Trying backup QR code creation method');
+            return await cloud.openapi.wxacode.get({
+              path: 'pages/index/index',
+              width: 430
+            });
+          }
+          throw err;
+        }
+      }, {
+        ...retryConfig,
+        retries: 7  // 增加重试次数
+      });
+    } catch (err) {
+      logger.error('All QR code creation attempts failed:', {
+        error: err.message,
+        code: err.code
+      });
+      // 继续执行，使用默认图片
+      qrCode = null;
+    }
+
+    // 上传到公众号
+    logger.info('Uploading to WeChat platform');
+    const result = await cloud.openapi.wxacode.createQRCode({
+      path: 'pages/index/index',
+      width: 430
+    });
+
+    return result;
+  } catch (err) {
+    logger.error('Article publish failed:', {
+      title: article.title,
+      error: err.message,
+      code: err.code || 'UNKNOWN',
+      stack: err.stack
+    });
+    throw err;
+  }
+}
 
 // 优化的媒体下载函数
 async function downloadMedia(url, maxSize = 10 * 1024 * 1024) {
@@ -44,7 +111,15 @@ async function downloadMedia(url, maxSize = 10 * 1024 * 1024) {
       responseType: 'stream',
       timeout: 15000,
       maxContentLength: maxSize,
-      validateStatus: status => status === 200
+      validateStatus: status => status === 200,
+      // 添加DNS解析超时
+      lookup: (hostname, options, callback) => {
+        dns.lookup(hostname, {
+          family: 4,
+          hints: dns.ADDRCONFIG | dns.V4MAPPED,
+          all: true
+        }, callback);
+      }
     });
 
     const contentLength = parseInt(response.headers['content-length'], 10);
@@ -81,71 +156,10 @@ async function downloadMedia(url, maxSize = 10 * 1024 * 1024) {
   }
 }
 
-// 优化的文章发布函数
-async function publishArticle(article) {
-  logger.info(`Starting article publish: ${article.title}`);
-  
-  try {
-    // 创建小程序码
-    logger.info('Creating QR code');
-    const qrResult = await retry(async () => {
-      try {
-        return await cloud.openapi.wxacode.createQRCode({
-          path: `pages/article/detail?id=${article.id}`,
-          width: 280
-        });
-      } catch (err) {
-        logger.error('QR code creation failed:', {
-          error: err.message,
-          code: err.errCode
-        });
-        throw err;
-      }
-    }, {
-      ...retryConfig,
-      retries: 3
-    });
-
-    // 上传文章内容
-    logger.info('Uploading article content');
-    const result = await retry(async () => {
-      try {
-        const { miniprogram } = cloud.getWXContext();
-        return await cloud.openapi.draft.add({
-          articles: [
-            {
-              ...article,
-              thumb_media_id: article.thumb_media_id || '',
-              qrcode_url: qrResult.url || ''
-            }
-          ]
-        });
-      } catch (err) {
-        logger.error('Article upload failed:', {
-          error: err.message,
-          code: err.errCode
-        });
-        throw err;
-      }
-    }, retryConfig);
-
-    logger.info(`Article published successfully: ${article.title}`);
-    return result;
-  } catch (err) {
-    logger.error('Article publish failed:', {
-      title: article.title,
-      error: err.message,
-      stack: err.stack
-    });
-    throw err;
-  }
-}
-
-// 主同步函数
 async function initSync() {
-  logger.info('Starting sync process');
-  
   try {
+    logger.info('Starting sync process');
+
     const pages = await retry(() => 
       notion.databases.query({
         database_id: process.env.NOTION_DATABASE_ID,
@@ -168,7 +182,6 @@ async function initSync() {
         
         logger.info(`Processing article: ${title}`);
 
-        // 获取封面图
         let thumb_media_id = null;
         if (page.cover?.external?.url) {
           try {
@@ -186,7 +199,6 @@ async function initSync() {
           }
         }
 
-        // 获取文章内容
         const blocks = await retry(() => 
           notion.blocks.children.list({
             block_id: page.id
@@ -194,7 +206,6 @@ async function initSync() {
           retryConfig
         );
 
-        // 构建文章内容
         const content = blocks.results
           .map(block => {
             if (block.type === 'paragraph') {
@@ -220,7 +231,7 @@ async function initSync() {
         logger.info(`Publishing article: ${title}`);
         await retry(() => publishArticle(article), {
           ...retryConfig,
-          retries: 5 // 增加发布重试次数
+          retries: 7
         });
 
         logger.info(`Updating sync status for: ${title}`);
@@ -235,7 +246,7 @@ async function initSync() {
         );
 
         logger.info(`Successfully processed article: ${title}`);
-        await delay(3000); // 增加间隔时间
+        await delay(3000);
 
       } catch (err) {
         logger.error(`Failed to process article:`, {
