@@ -174,39 +174,45 @@ async function getDatabaseSchema() {
 
 // 主同步函数
 async function initSync() {
-  let processedCount = 0;
-  let startCursor = undefined;
-  let hasMore = true;
-
   try {
     // 获取数据库结构
     const schema = await getDatabaseSchema();
-    logger.info("Database schema:", schema);
+    logger.info("Starting sync with schema:", {
+      properties: Object.keys(schema),
+      titleType: schema.title?.type,
+      typeOptions: schema.type?.select?.options,
+      statusOptions: schema.status?.select?.options,
+    });
+
+    let processedCount = 0;
+    let startCursor = undefined;
+    let hasMore = true;
 
     while (hasMore) {
-      // 使用小写属性名进行查询
       const response = await retry(
         () =>
           notion.databases.query({
             database_id: process.env.NOTION_DATABASE_ID,
             filter: {
               and: [
-                { property: "type", select: { equals: "Post" } },
-                { property: "status", select: { equals: "Published" } },
-                { property: "synced", checkbox: { equals: false } },
+                {
+                  property: "type",
+                  select: { equals: "Post" },
+                },
+                {
+                  property: "status",
+                  select: { equals: "Published" },
+                },
+                {
+                  property: "synced",
+                  checkbox: { equals: false },
+                },
               ],
             },
-            page_size: config.notion.pageSize,
             start_cursor: startCursor,
+            page_size: config.notion.pageSize,
           }),
-        {
-          ...config.notion.retryConfig,
-          onRetry: (err) => {
-            logger.warn("Retrying database query due to error:", {
-              error: err.message,
-            });
-          },
-        }
+        config.notion.retryConfig
       );
 
       hasMore = response.has_more;
@@ -216,42 +222,27 @@ async function initSync() {
         try {
           const props = page.properties;
 
-          // 使用小写属性名获取标题
-          const titleProp = props.title;
-
-          if (!titleProp) {
-            logger.warn("Page missing title property", {
+          // 检查必需属性
+          if (!props.title?.title?.[0]?.plain_text) {
+            logger.warn("Page missing title content", {
               pageId: page.id,
-              availableProperties: Object.keys(props),
-              propertyTypes: Object.entries(props).map(
-                ([k, v]) => `${k}: ${v.type}`
-              ),
-            });
-            continue;
-          }
-
-          const title = titleProp.title?.[0]?.plain_text;
-          if (!title) {
-            logger.warn("Empty title content", {
-              pageId: page.id,
-              titleProp,
+              properties: Object.keys(props),
+              titleProp: props.title,
             });
             continue;
           }
 
           const article = {
-            title,
-            author: props.author?.rich_text?.[0]?.plain_text || "Anonymous",
+            title: props.title.title[0].plain_text,
             summary: props.summary?.rich_text?.[0]?.plain_text || "",
-            cover: props.cover?.files?.[0]?.file?.url,
-            sourceUrl: page.url,
             content: await getAllBlocks(page.id),
+            sourceUrl: page.url,
           };
 
           // 发布文章
           await publishArticle(article);
 
-          // 更新同步状态（使用小写）
+          // 更新同步状态
           await retry(
             () =>
               notion.pages.update({
@@ -260,20 +251,13 @@ async function initSync() {
                   synced: { checkbox: true },
                 },
               }),
-            {
-              ...config.notion.retryConfig,
-              onRetry: (err) => {
-                logger.warn("Retrying page update due to error:", {
-                  error: err.message,
-                  pageId: page.id,
-                });
-              },
-            }
+            config.notion.retryConfig
           );
 
           processedCount++;
           logger.info(`Successfully processed article: ${article.title}`);
 
+          // 添加延迟避免频率限制
           await new Promise((resolve) =>
             setTimeout(resolve, config.sync.delay)
           );

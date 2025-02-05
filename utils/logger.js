@@ -13,10 +13,12 @@ const logger = winston.createLogger({
   ]
 });
 
-// 为morgan中间件创建stream
+// 修复morgan stream实现
 logger.stream = {
   write: function(message) {
-    logger.info(message.trim());
+    if(typeof message === 'string') {
+      logger.info(message.trim());
+    }
   }
 };
 
