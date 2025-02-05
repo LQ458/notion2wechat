@@ -2,6 +2,17 @@ const { Client } = require('@notionhq/client');
 const cloud = require('wx-server-sdk');
 const { retry, logger } = require('./utils');
 
+// 定义重试配置
+const retryConfig = {
+  retries: 5,                // 最大重试次数
+  minTimeout: 3000,          // 最小重试间隔(ms)
+  maxTimeout: 15000,         // 最大重试间隔(ms)
+  factor: 2,                 // 重试间隔增长因子
+  onRetry: (error, attempt) => {
+    logger.warn(`Retry attempt ${attempt} due to error: ${error.message}`);
+  }
+};
+
 // 初始化云开发
 cloud.init({
   env: process.env.WX_ENV,
@@ -14,6 +25,9 @@ const notion = new Client({
   timeoutMs: 30000
 });
 
+// 基础延迟函数
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 // 递归获取所有块内容
 async function getAllBlocks(blockId) {
   let allBlocks = [];
@@ -22,6 +36,7 @@ async function getAllBlocks(blockId) {
 
   while (hasMore) {
     try {
+      // 使用重试配置获取块内容
       const response = await retry(() => 
         notion.blocks.children.list({
           block_id: blockId,
@@ -38,7 +53,6 @@ async function getAllBlocks(blockId) {
       // 处理嵌套块
       await Promise.all(response.results.map(async (block) => {
         if (block.has_children) {
-          logger.debug(`Processing nested blocks in ${block.id}`);
           const childBlocks = await getAllBlocks(block.id);
           block.children = childBlocks;
         }
@@ -48,7 +62,8 @@ async function getAllBlocks(blockId) {
     } catch (err) {
       logger.error('Failed to retrieve blocks:', {
         blockId,
-        error: err.message
+        error: err.message,
+        stack: err.stack
       });
       throw err;
     }
@@ -57,78 +72,74 @@ async function getAllBlocks(blockId) {
   return allBlocks;
 }
 
-// 处理单个文章
-async function processArticle(page) {
-  try {
-    logger.info(`Processing article: ${page.id}`);
-    
-    // 获取所有块内容（含分页和嵌套）
-    const blocks = await getAllBlocks(page.id);
-    
-    // 构建文章内容
-    const content = blocks
-      .flatMap(block => extractBlockContent(block)) // 递归提取内容
-      .filter(Boolean)
-      .join('\n\n');
-
-    // 发布逻辑
-    // ... (保持原有发布逻辑)
-
-    logger.info(`Successfully processed article: ${page.id}`);
-    return true;
-
-  } catch (err) {
-    logger.error(`Failed to process article ${page.id}:`, {
-      error: err.message,
-      stack: err.stack
-    });
-    return false;
-  }
-}
-
-// 主同步逻辑
+// 主同步函数
 async function initSync() {
-  try {
-    logger.info('Starting sync process');
-    
-    // 分页获取所有待同步文章
-    let hasMore = true;
-    let startCursor = undefined;
-    let processedCount = 0;
+  let processedCount = 0;
+  let startCursor = undefined;
+  let hasMore = true;
 
+  try {
     while (hasMore) {
+      // 使用重试配置获取页面
       const response = await retry(() => 
         notion.databases.query({
           database_id: process.env.NOTION_DATABASE_ID,
           filter: {
             property: 'synced',
-            checkbox: { equals: false }
+            checkbox: {
+              equals: false
+            }
           },
-          page_size: 100,
+          page_size: 10,
           start_cursor: startCursor
         }),
         retryConfig
       );
 
-      const pages = response.results;
       hasMore = response.has_more;
       startCursor = response.next_cursor;
 
-      logger.info(`Found ${pages.length} articles to process`);
+      for (const page of response.results) {
+        try {
+          const title = page.properties.title?.title?.[0]?.plain_text;
+          logger.info(`Processing article: ${title}`);
 
-      // 分批处理避免内存溢出
-      for (const page of pages) {
-        const success = await processArticle(page);
-        if (!success) {
-          logger.warn(`Skipping article ${page.id} due to errors`);
-          continue;
-        }
-        processedCount++;
-        
-        // 每处理10篇文章清理内存
-        if (processedCount % 10 === 0) {
-          logger.info(`Processed ${processedCount} articles, clearing memory`);
-          if (global.gc) global.gc(); // 显式调用GC（如果启用）
+          // 获取文章内容
+          const blocks = await getAllBlocks(page.id);
+          const article = {
+            title,
+            content: blocks
+          };
+
+          // 发布文章
+          await retry(() => publishArticle(article), {
+            ...retryConfig,
+            retries: 7  // 发布时使用更多重试次数
+          });
+
+          // 更新同步状态
+          await retry(() => 
+            notion.pages.update({
+              page_id: page.id,
+              properties: {
+                synced: { checkbox: true }
+              }
+            }),
+            retryConfig
+          );
+
+          processedCount++;
+          logger.info(`Successfully processed article: ${title}`);
+          await delay(3000);  // 处理间隔
+
+        } catch (err) {
+          logger.error(`Failed to process article:`, {
+            pageId: page.id,
+            title: page.properties.title?.title?.[0]?.plain_text,
+            error: err.message,
+            stack: err.stack
+          });
+          continue;  // 继续处理下一篇文章
         }
       }
 
@@ -147,41 +158,6 @@ async function initSync() {
       stack: err.stack
     });
     throw err;
-  }
-}
-
-// 辅助函数：提取块内容
-function extractBlockContent(block) {
-  try {
-    let contents = [];
-    
-    // 处理当前块内容
-    switch (block.type) {
-      case 'paragraph':
-        contents.push(block.paragraph.text.map(t => t.plain_text).join(''));
-        break;
-      case 'heading_1':
-      case 'heading_2':
-      case 'heading_3':
-        contents.push(block[block.type].text.map(t => t.plain_text).join(''));
-        break;
-      // 其他块类型处理...
-    }
-
-    // 递归处理子块
-    if (block.children) {
-      block.children.forEach(child => {
-        contents = contents.concat(extractBlockContent(child));
-      });
-    }
-
-    return contents;
-  } catch (err) {
-    logger.error('Failed to extract block content:', {
-      blockId: block.id,
-      error: err.message
-    });
-    return [];
   }
 }
 
