@@ -2,10 +2,11 @@ module.exports = {
   notion: {
     pageSize: 10,
     retryConfig: {
-      retries: 5,
-      minTimeout: 3000,
-      maxTimeout: 15000,
-      factor: 2
+      retries: 8,
+      minTimeout: 5000,
+      maxTimeout: 30000,
+      factor: 2,
+      randomize: true
     }
   },
   
@@ -21,7 +22,7 @@ module.exports = {
   },
 
   sync: {
-    interval: 5 * 60 * 1000, // 5分钟
-    delay: 3000 // 3秒
+    interval: 5 * 60 * 1000,
+    delay: 5000
   }
 }; 
