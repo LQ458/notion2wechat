@@ -175,9 +175,18 @@ async function initSync() {
             database_id: process.env.NOTION_DATABASE_ID,
             filter: {
               and: [
-                { property: "type", select: { equals: "Post" } },
-                { property: "status", select: { equals: "Published" } },
-                { property: "synced", checkbox: { equals: false } },
+                {
+                  property: "Type",
+                  select: { equals: "Post" },
+                },
+                {
+                  property: "Status",
+                  select: { equals: "Published" },
+                },
+                {
+                  property: "Synced",
+                  checkbox: { equals: false },
+                },
               ],
             },
             page_size: config.notion.pageSize,
@@ -194,6 +203,12 @@ async function initSync() {
         }
       );
 
+      // 打印完整的响应用于调试
+      logger.debug("Database query response:", {
+        hasMore: response.has_more,
+        resultCount: response.results.length,
+      });
+
       hasMore = response.has_more;
       startCursor = response.next_cursor;
 
@@ -208,13 +223,14 @@ async function initSync() {
             propertyTypes: Object.entries(props).map(([key, value]) => ({
               name: key,
               type: value.type,
+              value: value,
             })),
           });
 
           // 查找标题属性(不区分大小写)
           const titleProp = Object.entries(props).find(
             ([key, value]) =>
-              key.toLowerCase() === "title" && value.type === "title"
+              key.toLowerCase() === "title" || key.toLowerCase() === "name"
           );
 
           if (!titleProp) {
@@ -226,16 +242,23 @@ async function initSync() {
           }
 
           const [titleKey, titleValue] = titleProp;
-          if (!titleValue.title || !titleValue.title.length) {
+
+          // 放宽标题检查条件
+          const titleText =
+            titleValue.title?.[0]?.plain_text ||
+            titleValue.rich_text?.[0]?.plain_text;
+
+          if (!titleText) {
             logger.warn("Skipping page due to empty title", {
               pageId: page.id,
               titleProperty: titleKey,
+              titleValue: titleValue,
             });
             continue;
           }
 
           const article = {
-            title: titleValue.title[0].plain_text,
+            title: titleText,
             author:
               props.Author?.rich_text?.[0]?.plain_text ||
               props.author?.rich_text?.[0]?.plain_text ||
@@ -304,4 +327,7 @@ async function initSync() {
   }
 }
 
-module.exports = { initSync };
+module.exports = {
+  initSync,
+  getAllBlocks,
+};
