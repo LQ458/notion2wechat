@@ -201,20 +201,52 @@ async function initSync() {
         try {
           const props = page.properties;
 
-          // 添加更详细的属性检查
-          if (!props.Title || !props.Title.title || !props.Title.title.length) {
-            logger.warn("Skipping page due to missing or invalid title", {
+          // 打印完整的属性信息用于调试
+          logger.debug("Page properties:", {
+            pageId: page.id,
+            propertyNames: Object.keys(props),
+            propertyTypes: Object.entries(props).map(([key, value]) => ({
+              name: key,
+              type: value.type,
+            })),
+          });
+
+          // 查找标题属性(不区分大小写)
+          const titleProp = Object.entries(props).find(
+            ([key, value]) =>
+              key.toLowerCase() === "title" && value.type === "title"
+          );
+
+          if (!titleProp) {
+            logger.warn("Skipping page due to missing title property", {
               pageId: page.id,
-              properties: Object.keys(props),
+              availableProperties: Object.keys(props),
+            });
+            continue;
+          }
+
+          const [titleKey, titleValue] = titleProp;
+          if (!titleValue.title || !titleValue.title.length) {
+            logger.warn("Skipping page due to empty title", {
+              pageId: page.id,
+              titleProperty: titleKey,
             });
             continue;
           }
 
           const article = {
-            title: props.Title.title[0].plain_text,
-            author: props.Author?.rich_text?.[0]?.plain_text || "Anonymous",
-            summary: props.Summary?.rich_text?.[0]?.plain_text || "",
-            cover: props.Cover?.files?.[0]?.file?.url,
+            title: titleValue.title[0].plain_text,
+            author:
+              props.Author?.rich_text?.[0]?.plain_text ||
+              props.author?.rich_text?.[0]?.plain_text ||
+              "Anonymous",
+            summary:
+              props.Summary?.rich_text?.[0]?.plain_text ||
+              props.summary?.rich_text?.[0]?.plain_text ||
+              "",
+            cover:
+              props.Cover?.files?.[0]?.file?.url ||
+              props.cover?.files?.[0]?.file?.url,
             sourceUrl: page.url,
             content: await getAllBlocks(page.id),
           };
@@ -222,13 +254,14 @@ async function initSync() {
           // 发布文章
           await publishArticle(article);
 
-          // 更新同步状态
+          // 更新同步状态(同时处理大小写)
           await retry(
             () =>
               notion.pages.update({
                 page_id: page.id,
                 properties: {
-                  Synced: { checkbox: true },
+                  synced: { checkbox: true }, // 使用小写
+                  Synced: { checkbox: true }, // 使用大写
                 },
               }),
             {
@@ -252,9 +285,9 @@ async function initSync() {
         } catch (err) {
           logger.error("Failed to process article:", {
             pageId: page.id,
-            title: props.Title?.title?.[0]?.plain_text,
             error: err.message,
             stack: err.stack,
+            properties: Object.keys(props),
           });
           continue;
         }
