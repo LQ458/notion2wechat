@@ -160,6 +160,18 @@ async function getAllBlocks(blockId) {
   return allBlocks;
 }
 
+// 获取数据库schema
+async function getDatabaseSchema() {
+  const database = await notion.databases.retrieve({
+    database_id: process.env.NOTION_DATABASE_ID,
+  });
+  logger.info("Database schema:", {
+    properties: Object.keys(database.properties),
+    propertyDetails: database.properties,
+  });
+  return database.properties;
+}
+
 // 主同步函数
 async function initSync() {
   let processedCount = 0;
@@ -167,6 +179,9 @@ async function initSync() {
   let hasMore = true;
 
   try {
+    // 获取数据库结构
+    const schema = await getDatabaseSchema();
+
     while (hasMore) {
       // 使用重试配置获取页面
       const response = await retry(
@@ -175,18 +190,9 @@ async function initSync() {
             database_id: process.env.NOTION_DATABASE_ID,
             filter: {
               and: [
-                {
-                  property: "type",
-                  select: { equals: "Post" },
-                },
-                {
-                  property: "status",
-                  select: { equals: "Published" },
-                },
-                {
-                  property: "synced",
-                  checkbox: { equals: false },
-                },
+                { property: "type", select: { equals: "Post" } },
+                { property: "status", select: { equals: "Published" } },
+                { property: "synced", checkbox: { equals: false } },
               ],
             },
             page_size: config.notion.pageSize,
@@ -203,12 +209,6 @@ async function initSync() {
         }
       );
 
-      // 打印完整的响应用于调试
-      logger.debug("Database query response:", {
-        hasMore: response.has_more,
-        resultCount: response.results.length,
-      });
-
       hasMore = response.has_more;
       startCursor = response.next_cursor;
 
@@ -219,57 +219,38 @@ async function initSync() {
           // 打印完整的属性信息用于调试
           logger.debug("Page properties:", {
             pageId: page.id,
-            propertyNames: Object.keys(props),
-            propertyTypes: Object.entries(props).map(([key, value]) => ({
-              name: key,
-              type: value.type,
-              value: value,
-            })),
+            properties: props,
+            schemaProperties: schema,
           });
 
-          // 查找标题属性(不区分大小写)
-          const titleProp = Object.entries(props).find(
-            ([key, value]) =>
-              key.toLowerCase() === "title" || key.toLowerCase() === "name"
-          );
+          // 获取Name或Title属性
+          const titleProp = props.Name || props.Title;
 
           if (!titleProp) {
-            logger.warn("Skipping page due to missing title property", {
+            logger.warn("Page missing Name/Title property", {
               pageId: page.id,
               availableProperties: Object.keys(props),
+              propertyTypes: Object.entries(props).map(
+                ([k, v]) => `${k}: ${v.type}`
+              ),
             });
             continue;
           }
 
-          const [titleKey, titleValue] = titleProp;
-
-          // 放宽标题检查条件
-          const titleText =
-            titleValue.title?.[0]?.plain_text ||
-            titleValue.rich_text?.[0]?.plain_text;
-
-          if (!titleText) {
-            logger.warn("Skipping page due to empty title", {
+          const title = titleProp.title?.[0]?.plain_text;
+          if (!title) {
+            logger.warn("Empty title content", {
               pageId: page.id,
-              titleProperty: titleKey,
-              titleValue: titleValue,
+              titleProp,
             });
             continue;
           }
 
           const article = {
-            title: titleText,
-            author:
-              props.Author?.rich_text?.[0]?.plain_text ||
-              props.author?.rich_text?.[0]?.plain_text ||
-              "Anonymous",
-            summary:
-              props.Summary?.rich_text?.[0]?.plain_text ||
-              props.summary?.rich_text?.[0]?.plain_text ||
-              "",
-            cover:
-              props.Cover?.files?.[0]?.file?.url ||
-              props.cover?.files?.[0]?.file?.url,
+            title,
+            author: props.Author?.rich_text?.[0]?.plain_text || "Anonymous",
+            summary: props.Summary?.rich_text?.[0]?.plain_text || "",
+            cover: props.Cover?.files?.[0]?.file?.url,
             sourceUrl: page.url,
             content: await getAllBlocks(page.id),
           };
@@ -277,14 +258,13 @@ async function initSync() {
           // 发布文章
           await publishArticle(article);
 
-          // 更新同步状态(同时处理大小写)
+          // 更新同步状态
           await retry(
             () =>
               notion.pages.update({
                 page_id: page.id,
                 properties: {
                   synced: { checkbox: true }, // 使用小写
-                  Synced: { checkbox: true }, // 使用大写
                 },
               }),
             {
@@ -301,7 +281,6 @@ async function initSync() {
           processedCount++;
           logger.info(`Successfully processed article: ${article.title}`);
 
-          // 处理间隔
           await new Promise((resolve) =>
             setTimeout(resolve, config.sync.delay)
           );
@@ -310,7 +289,7 @@ async function initSync() {
             pageId: page.id,
             error: err.message,
             stack: err.stack,
-            properties: Object.keys(props),
+            properties: props,
           });
           continue;
         }
@@ -327,7 +306,4 @@ async function initSync() {
   }
 }
 
-module.exports = {
-  initSync,
-  getAllBlocks,
-};
+module.exports = { initSync };
