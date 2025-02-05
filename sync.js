@@ -181,9 +181,10 @@ async function initSync() {
   try {
     // 获取数据库结构
     const schema = await getDatabaseSchema();
+    logger.info("Database schema:", schema);
 
     while (hasMore) {
-      // 使用重试配置获取页面
+      // 使用小写属性名进行查询
       const response = await retry(
         () =>
           notion.databases.query({
@@ -203,7 +204,6 @@ async function initSync() {
           onRetry: (err) => {
             logger.warn("Retrying database query due to error:", {
               error: err.message,
-              code: err.code,
             });
           },
         }
@@ -216,18 +216,11 @@ async function initSync() {
         try {
           const props = page.properties;
 
-          // 打印完整的属性信息用于调试
-          logger.debug("Page properties:", {
-            pageId: page.id,
-            properties: props,
-            schemaProperties: schema,
-          });
-
-          // 获取Name或Title属性
-          const titleProp = props.Name || props.Title;
+          // 使用小写属性名获取标题
+          const titleProp = props.title;
 
           if (!titleProp) {
-            logger.warn("Page missing Name/Title property", {
+            logger.warn("Page missing title property", {
               pageId: page.id,
               availableProperties: Object.keys(props),
               propertyTypes: Object.entries(props).map(
@@ -248,9 +241,9 @@ async function initSync() {
 
           const article = {
             title,
-            author: props.Author?.rich_text?.[0]?.plain_text || "Anonymous",
-            summary: props.Summary?.rich_text?.[0]?.plain_text || "",
-            cover: props.Cover?.files?.[0]?.file?.url,
+            author: props.author?.rich_text?.[0]?.plain_text || "Anonymous",
+            summary: props.summary?.rich_text?.[0]?.plain_text || "",
+            cover: props.cover?.files?.[0]?.file?.url,
             sourceUrl: page.url,
             content: await getAllBlocks(page.id),
           };
@@ -258,13 +251,13 @@ async function initSync() {
           // 发布文章
           await publishArticle(article);
 
-          // 更新同步状态
+          // 更新同步状态（使用小写）
           await retry(
             () =>
               notion.pages.update({
                 page_id: page.id,
                 properties: {
-                  synced: { checkbox: true }, // 使用小写
+                  synced: { checkbox: true },
                 },
               }),
             {
